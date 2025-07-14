@@ -1,0 +1,10 @@
+requests
+flask
+openai
+twitchio
+twitchio[starlette]
+python-dotenv
+transformers
+diffusers
+git+https://github.com/Rapptz/asqlite.git
+uvicorn
