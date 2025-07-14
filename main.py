@@ -23,10 +23,6 @@ class MyComponent(commands.Component):
         super().__init__()
         self.bot = bot
 
-    @commands.command()
-    async def hi(self, ctx: commands.Context):
-        await ctx.reply(f"Hi {ctx.chatter}!")
-
 class Bot(commands.AutoBot):
     def __init__(self):
         super().__init__(
@@ -36,7 +32,7 @@ class Bot(commands.AutoBot):
             owner_id=TWITCH_OWNER_ID,
             prefix="!",
             redirect_uri="http://localhost:4343/oauth",
-            scopes=["user:read:chat", "user:write:chat", "user:bot", "channel:read:redemptions"],
+            scopes=["user:read:chat", "user:write:chat", "user:bot", "channel:read:redemptions", "moderator:read:chat_messages"],
         )
 
     async def setup_hook(self):
@@ -63,10 +59,62 @@ class Bot(commands.AutoBot):
             # If no specific channel is configured, use the bot's own channel
             # Note: For AutoBot, we need to get the owner's ID
             target_channel_id = self.owner_id
-            LOGGER.info(f"No TWITCH_CHANNEL configured, using owner's channel: {target_channel_id}")
+            LOGGER.info(f"No TWITCH_CHANNEL configured, using owner's channel: {target_channel_id}")        # Check if we have a token for the target channel owner
+        channel_token = None
+        if self.tokens:
+            for token_id, token in self.tokens.items():
+                if token_id == str(target_channel_id):
+                    channel_token = token
+                    break
+
+        if not channel_token:
+            LOGGER.warning(f"⚠️  No token found for channel owner (ID: {target_channel_id})")
+            LOGGER.warning("   Channel points redemptions will likely fail with 403 Forbidden")
+            LOGGER.warning("   The channel owner needs to authorize this bot!")        # First, let's check existing subscriptions
+        try:
+            LOGGER.info("🔍 Checking existing EventSub subscriptions...")
+            existing_subs = await self.fetch_eventsub_subscriptions()
+            # Handle the EventsubSubscriptions object properly
+            if hasattr(existing_subs, '__iter__'):
+                subs_list = list(existing_subs)
+            else:
+                subs_list = []
+                LOGGER.warning(f"Cannot iterate over subscriptions object: {type(existing_subs)}")
+
+            LOGGER.info(f"Found {len(subs_list)} existing subscriptions")
+            for i, sub in enumerate(subs_list):
+                LOGGER.info(f"  {i+1}. {sub.type} (status: {sub.status}, id: {sub.id})")
+
+            # If we can't see subscriptions but get 409 conflicts, try to delete all subscriptions
+            if len(subs_list) == 0:
+                LOGGER.info("🗑️ No subscriptions visible but conflicts exist - attempting to delete all subscriptions")
+                try:
+                    # This should delete all EventSub subscriptions for our client
+                    await self.delete_eventsub_subscriptions()
+                    LOGGER.info("✅ Deleted all EventSub subscriptions")
+                except Exception as delete_error:
+                    LOGGER.warning(f"Could not delete all subscriptions: {delete_error}")
+
+        except Exception as e:
+            LOGGER.error(f"Error fetching existing subscriptions: {e}")
+            subs_list = []
 
         # Subscribe to events for the target channel
         if target_channel_id:
+            # Try to clean up existing subscriptions that might conflict
+            try:
+                LOGGER.info("🧹 Attempting to clean up conflicting subscriptions...")
+                for sub in subs_list:
+                    if sub.type == 'channel.chat.message' and hasattr(sub, 'condition'):
+                        condition_broadcaster = sub.condition.get('broadcaster_user_id') if isinstance(sub.condition, dict) else getattr(sub.condition, 'broadcaster_user_id', None)
+                        if str(condition_broadcaster) == str(target_channel_id):
+                            LOGGER.info(f"Found existing chat subscription: {sub.id}, deleting it...")
+                            await self.delete_eventsub_subscription(sub.id)
+                            LOGGER.info("✅ Deleted existing chat subscription")
+                            break
+            except Exception as e:
+                LOGGER.warning(f"Could not clean up existing subscriptions: {e}")
+
             subs = [
                 # Chat messages for the target channel
                 eventsub.ChatMessageSubscription(broadcaster_user_id=target_channel_id, user_id=self.bot_id),
@@ -78,11 +126,45 @@ class Bot(commands.AutoBot):
                 LOGGER.info(f"Attempting to subscribe to EventSub events for channel {target_channel_id}")
                 resp = await self.multi_subscribe(subs)
                 if resp.errors:
-                    LOGGER.warning(f"Failed to subscribe to some events: {resp.errors}")
+                    LOGGER.warning(f"Failed to subscribe to some events:")
+                    has_conflicts = False
+                    for error in resp.errors:
+                        LOGGER.warning(f"  - {error.subscription.__class__.__name__}: {error.error}")
+                        if "409" in str(error.error):
+                            has_conflicts = True
+                            LOGGER.warning(f"❌ Subscription conflict: {error.subscription.__class__.__name__}")
+                        elif "403" in str(error.error) and "ChannelPoints" in error.subscription.__class__.__name__:
+                            LOGGER.error("❌ Channel Points subscription failed with 403 Forbidden!")
+                            LOGGER.error("   This means the bot needs to be authorized by the channel owner.")
+                            LOGGER.error("   Make sure the channel owner has authorized this bot with channel:read:redemptions scope.")
+
+                    # If we have conflicts, try the nuclear option: delete all and retry
+                    if has_conflicts:
+                        LOGGER.info("🧨 Trying nuclear option: delete all subscriptions and retry...")
+                        try:
+                            await self.delete_eventsub_subscriptions()
+                            LOGGER.info("✅ Deleted all subscriptions, retrying...")
+
+                            # Wait a moment for deletion to propagate
+                            await asyncio.sleep(2)
+
+                            # Retry subscription
+                            resp2 = await self.multi_subscribe(subs)
+                            if resp2.errors:
+                                LOGGER.error("❌ Still failed after cleanup:")
+                                for error in resp2.errors:
+                                    LOGGER.error(f"  - {error.subscription.__class__.__name__}: {error.error}")
+                            else:
+                                LOGGER.info("🎉 SUCCESS! All subscriptions created after cleanup!")
+                                for sub in subs:
+                                    LOGGER.info(f"  ✅ {sub.__class__.__name__}")
+                        except Exception as cleanup_error:
+                            LOGGER.error(f"Nuclear cleanup failed: {cleanup_error}")
+
                     for success in resp.success:
-                        LOGGER.info(f"Successfully subscribed to: {success.subscription.type}")
+                        LOGGER.info(f"✅ Successfully subscribed to: {success.subscription.type}")
                 else:
-                    LOGGER.info(f"Successfully subscribed to all {len(subs)} events for channel {target_channel_id}")
+                    LOGGER.info(f"✅ Successfully subscribed to all {len(subs)} events for channel {target_channel_id}")
                     for sub in subs:
                         LOGGER.info(f"  - {sub.__class__.__name__}")
             except Exception as e:
@@ -126,8 +208,62 @@ class Bot(commands.AutoBot):
         print(f"IRC Message: {message.chatter.name}: {message.text}")
         return
 
-    async def event_error(self, error: twitchio.EventErrorPayload):
-        print(f"Error occurred: {error.error}")
+    # Override ALL possible event methods to catch anything
+    def __getattr__(self, name):
+        if name.startswith('event_'):
+            async def debug_handler(*args, **kwargs):
+                print(f"🔥 CAUGHT EVENT: {name}")
+                print(f"   Args: {[type(arg).__name__ for arg in args]}")
+
+                # Special handling for specific events we care about
+                if 'chat' in name.lower() and args:
+                    print(f"💬 CHAT EVENT DETECTED!")
+                    print(f"   Full args: {args}")
+                    try:
+                        payload = args[0]
+                        if hasattr(payload, 'chatter_user_name') and hasattr(payload, 'message'):
+                            print(f"   Chat: {payload.chatter_user_name}: {payload.message.text}")
+                        elif hasattr(payload, 'event'):
+                            event = payload.event
+                            if hasattr(event, 'chatter_user_name') and hasattr(event, 'message'):
+                                print(f"   Chat: {event.chatter_user_name}: {event.message.text}")
+                    except Exception as e:
+                        print(f"   Error parsing chat: {e}")
+
+                elif 'point' in name.lower() and args:
+                    print(f"🎁 CHANNEL POINTS EVENT DETECTED!")
+                    print(f"   Full args: {args}")
+
+                return
+            return debug_handler
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+
+    # Specific EventSub handlers
+    async def event_eventsub_notification_channel_chat_message(self, data):
+        """EventSub chat message handler - specific method"""
+        print(f"💬 EventSub Chat (specific): Received chat message event")
+        print(f"   Data type: {type(data)}")
+        print(f"   Data: {data}")
+        return
+
+    async def event_eventsub_notification(self, payload):
+        """Generic EventSub notification handler"""
+        print(f"📡 EventSub notification (generic): {type(payload).__name__}")
+        print(f"   Payload: {payload}")
+        return
+
+    async def on_eventsub_notification(self, payload):
+        """Alternative EventSub handler name"""
+        print(f"📡 EventSub (on_): {type(payload).__name__}")
+        return
+
+    async def eventsub_notification(self, payload):
+        """Another alternative EventSub handler name"""
+        print(f"📡 EventSub (direct): {type(payload).__name__}")
+        return
+
+    async def event_error(self, error):
+        print(f"Error occurred: {error}")
         return
 
     async def event_custom_redemption_add(self, payload: twitchio.ChannelPointsRedemptionAdd):
@@ -135,11 +271,6 @@ class Bot(commands.AutoBot):
         print(f"🎁 Channel points redeemed: {payload.reward.title} by {payload.user.display_name}")
         if payload.user_input:
             print(f"   User input: {payload.user_input}")
-        return
-
-    async def event_eventsub_notification_received(self, payload):
-        """Debug handler for all EventSub notifications"""
-        print(f"📡 EventSub notification received: {type(payload).__name__}")
         return
 
 async def main():
